@@ -1907,6 +1907,15 @@ SoilConstants.COMPACTION = {
         BAR_TO_KPA         = 100.0,  -- 1 bar = 100 kPa (VTP reports pressure in bar)
         CONTACT_OFFSET_KPA = 10.0,   -- surface contact pressure ≈ tyre pressure + ~1-2 psi (PSU)
         CONTACT_LENGTH_FACTOR = 0.35,-- geometry fallback: contact-patch length ≈ radius × this
+        -- Fully rubber-tracked vehicles, on the same basis as a tyre's inflation + 10 kPa
+        -- (scores like a tyre at ~0.75 bar). Nominal track mean pressure is 40-50 kPa, but
+        -- the load sits under the rollers (peaks 3.7-7x the mean vs ~1.4x for tyres), so the
+        -- figure comes from measured soil stress instead: tracks matched duals at 0.47-0.68
+        -- bar at 15 cm (Arvidsson & Keller 2014, same field and sensors), and a balanced
+        -- track's 0.1 m peak inverts to ~106 on this scale (Keller 2004 thesis tyre fit).
+        -- Defensible range 60-110. The subsoil term stays on load: tracks beat single tyres
+        -- at depth but not low-pressure duals.
+        TRACK_CONTACT_KPA  = 85.0,
     },
 
     -- Subsoil term: axle load → points. Independent of tyre size (deep damage).

@@ -18,6 +18,17 @@
 --   - airing down to FIELD mode automatically lowers compaction. With VTP absent we
 --   approximate contact pressure from each tyre's own loaded size instead (#1057).
 --
+-- Mud System Physics (BMP, ModHub) integration:
+--   MSP keeps its own per-wheel tyre pressure (0.8-2.8 bar). It has no public API, so
+--   we read its TirePressureSystem from MSP's own mod environment (_G[modName]) and
+--   convert the vehicle's own average pressure exactly as the VTP bar value. Order per
+--   vehicle: VTP where active, then MSP, then the geometry estimate.
+--
+-- Fully tracked vehicles: the geometry estimate reads track rollers as tiny tyres and
+--   always gave the maximum surface points. They get a fixed TRACK_CONTACT_KPA instead
+--   (measured soil stress, see Constants) and never take the MSP read (VTP leaves
+--   crawler wheels out too). The subsoil term stays on load.
+--
 -- The vehicle/VTP reads live here; the scoring math (scorePoints / advanceWetness) is
 -- pure and unit-tested under tools/test.
 -- =====================================================================================
@@ -101,13 +112,127 @@ function SoilCompactionModel.readVTPPressureKPa(vehicle)
 end
 
 -- -------------------------------------------------------------------------------------
+-- Mud System Physics read. MSP's TirePressureSystem is a global in MSP's own mod
+-- environment, reached through _G[modName] (the route MSP itself uses for Use Your
+-- Tyres). The mod name is resolved once per mission; the table is re-read on every
+-- call, and anything unexpected returns nil so the caller falls back to geometry.
+-- -------------------------------------------------------------------------------------
+SoilCompactionModel.MSP_NAME_PATTERNS = { "mudsystem", "mud_system", "mudphysic" }
+
+local mspLookup = { mission = nil, modName = nil }
+
+local function scanMSPModName()
+    if g_modIsLoaded == nil then return false end
+    for modName, loaded in pairs(g_modIsLoaded) do
+        if loaded then
+            local lower = string.lower(tostring(modName))
+            for _, pattern in ipairs(SoilCompactionModel.MSP_NAME_PATTERNS) do
+                if lower:find(pattern, 1, true) then
+                    local env = _G[modName]
+                    if type(env) == "table" and type(rawget(env, "TirePressureSystem")) == "table" then
+                        return modName
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function resolveMSPModName()
+    local mission = g_currentMission
+    if mission == nil or mspLookup.mission ~= mission then
+        mspLookup.modName = scanMSPModName()
+        if mission ~= nil then
+            mspLookup.mission = mission
+            if mspLookup.modName then
+                SoilLogger.info("Compaction: Mud System Physics tire pressure found (%s)", tostring(mspLookup.modName))
+            else
+                SoilLogger.info("Compaction: Mud System Physics tire pressure not found - wheel-size estimate only")
+            end
+        end
+    end
+    return mspLookup.modName
+end
+
+local function getMSPTirePressureSystem()
+    local modName = resolveMSPModName()
+    if not modName then return nil end
+    local env = _G[modName]
+    if type(env) ~= "table" then return nil end
+    local tps = rawget(env, "TirePressureSystem")
+    if type(tps) ~= "table" or type(tps.getVehicleWheelPressureAverage) ~= "function" then return nil end
+    return tps
+end
+
+-- True when every wheel of the vehicle belongs to a track: linked by the Crawlers
+-- specialization, or carrying the "crawler" tire type (the two checks VTP uses).
+-- Mixed machines (tracks plus tyres) are not fully tracked and keep the MSP read.
+local function isFullyTracked(vehicle)
+    local wheels = vehicle.spec_wheels and vehicle.spec_wheels.wheels
+    if type(wheels) ~= "table" then return false end
+
+    local trackWheels = {}
+    local crawlerSpec = vehicle.spec_crawlers
+    if crawlerSpec ~= nil and type(crawlerSpec.crawlers) == "table" then
+        for _, crawler in pairs(crawlerSpec.crawlers) do
+            if type(crawler) == "table" then
+                if crawler.wheel ~= nil then trackWheels[crawler.wheel] = true end
+                if type(crawler.wheels) == "table" then
+                    for _, entry in pairs(crawler.wheels) do
+                        if type(entry) == "table" and entry.wheel ~= nil then
+                            trackWheels[entry.wheel] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local crawlerTireType = nil
+    if WheelsUtil ~= nil and WheelsUtil.getTireType ~= nil then
+        local ok, tireType = pcall(WheelsUtil.getTireType, "crawler")
+        if ok then crawlerTireType = tireType end
+    end
+
+    local anyWheel = false
+    for _, wheel in pairs(wheels) do
+        if type(wheel) == "table" then
+            anyWheel = true
+            local phys = wheel.physics
+            local isCrawlerTire = crawlerTireType ~= nil and phys ~= nil and phys.tireType == crawlerTireType
+            if not trackWheels[wheel] and not isCrawlerTire then
+                return false
+            end
+        end
+    end
+    return anyWheel
+end
+
+-- Live average pressure of THIS vehicle's own wheels as contact pressure in kPa, or nil
+-- when MSP is missing, its tire pressure is switched off (values would be frozen), the
+-- vehicle is fully tracked, or the read returns anything unexpected.
+function SoilCompactionModel.readMSPPressureKPa(vehicle)
+    if vehicle == nil or vehicle.spec_wheels == nil then return nil end
+    local tps = getMSPTirePressureSystem()
+    if tps == nil or tps.enabled == false then return nil end
+    if isFullyTracked(vehicle) then return nil end
+
+    local ok, currentBar, _, wheelCount = pcall(tps.getVehicleWheelPressureAverage, tps, vehicle)
+    if not ok or type(currentBar) ~= "number" or currentBar <= 0 then return nil end
+    if type(wheelCount) ~= "number" or wheelCount <= 0 then return nil end
+    local gp = SoilConstants.COMPACTION.GROUND_PRESSURE
+    return currentBar * gp.BAR_TO_KPA + gp.CONTACT_OFFSET_KPA
+end
+
+-- -------------------------------------------------------------------------------------
 -- Geometry fallback: contact pressure ≈ (own weight) / (Σ tyre contact patch), where a
 -- patch ≈ width × (radius × CONTACT_LENGTH_FACTOR). The radius is the tyre's loaded size,
 -- radiusOriginal, which the engine sets once from the wheel XML (WheelPhysics:loadFromXML
 -- at game 1.24.0.0); the live radius is only the fallback when that is missing. A mod that
 -- shrinks the live radius at runtime (airing down, sinking, wear) no longer shrinks the
 -- patch and raises this estimate, the opposite of the design above (#1057). Airing down
--- lowers compaction only through a pressure read, which today is VTP's (above).
+-- lowers compaction only through a pressure read: VTP's or MSP's (above).
 -- -------------------------------------------------------------------------------------
 function SoilCompactionModel.readGeometryPressureKPa(vehicle, massT)
     if vehicle == nil or not massT or massT <= 0 then return nil end
@@ -167,7 +292,7 @@ end
 -- -------------------------------------------------------------------------------------
 -- Resolve (pressureKPa, axleLoadT, source) for a vehicle. Everything is self-consistent
 -- to THIS vehicle (its own mass over its own wheels). Returns nil if mass is unreadable.
---   source ∈ "vtp" | "geometry"
+--   source ∈ "vtp" | "tracks" | "msp" | "geometry"
 -- -------------------------------------------------------------------------------------
 function SoilCompactionModel.computeForVehicle(vehicle)
     if vehicle == nil then return nil end
@@ -178,8 +303,16 @@ function SoilCompactionModel.computeForVehicle(vehicle)
     local pressureKPa = SoilCompactionModel.readVTPPressureKPa(vehicle)
     if pressureKPa then
         source = "vtp"
+    elseif isFullyTracked(vehicle) then
+        pressureKPa = SoilConstants.COMPACTION.GROUND_PRESSURE.TRACK_CONTACT_KPA
+        source = "tracks"
     else
-        pressureKPa = SoilCompactionModel.readGeometryPressureKPa(vehicle, massT)
+        pressureKPa = SoilCompactionModel.readMSPPressureKPa(vehicle)
+        if pressureKPa then
+            source = "msp"
+        else
+            pressureKPa = SoilCompactionModel.readGeometryPressureKPa(vehicle, massT)
+        end
     end
 
     local axleLoadT = massT / countAxles(vehicle)
